@@ -1,0 +1,217 @@
+library(sf)
+library(dplyr)
+library(tidyr)
+library(glmmTMB)
+library(tibble)
+base_dir  <- "E:/.../DATA"
+years     <- c(2001, 2010, 2020)
+buffers   <- c("300M", "1KM")
+responses <- c("FishCo", "SpeCo")
+site_id   <- "Station_Nu"
+lu_all <- c("Residential","Commercial","Industrial","Institutional",
+            "TCU","Agricultural","OpenSpace","VacUC","WaterOther")
+ref_class <- "WaterOther"
+yr_suffix <- function(y) {
+  if (y == 2001) return("01")
+  if (y == 2010) return("10")
+  if (y == 2020) return("20")
+  stop("Year must be one of 2001, 2010, 2020")
+}
+build_path <- function(base_dir, buffer, year) {
+  file.path(base_dir, paste0(buffer, "_", year), paste0(buffer, "_", year, ".shp"))
+}
+partial_pseudo_r2 <- function(m_reduced, m_full) {
+  ll_red  <- as.numeric(logLik(m_reduced))  # WQ-only
+  ll_full <- as.numeric(logLik(m_full))     # WQ + LU
+  r2 <- 1 - (ll_full / ll_red)
+  list(r2 = r2, ll_reduced = ll_red, ll_full = ll_full)
+}
+is_bad_fit <- function(mod) {
+  bad_ll <- anyNA(c(as.numeric(logLik(mod)), AIC(mod)))
+  bad_hess <- isTRUE(tryCatch(mod$sdr$pdHess == FALSE, error = function(e) FALSE))
+  bad_ll || bad_hess
+}
+safe_lrt_p <- function(m1, m2) {
+  out <- tryCatch({
+    lrt <- anova(m1, m2)
+    p <- lrt$`Pr(>Chisq)`[2]
+    list(p = p, msg = "")
+  }, error = function(e) {
+    list(p = NA_real_, msg = paste("anova failed:", conditionMessage(e)))
+  })
+  out
+}
+reclass_landuse <- function(dat, year) {
+  dat %>%
+    mutate(
+      Land_Use = case_when(
+        year == 2001 & LANDUSE %in% c(1110, 1111, 1120, 1112, 1130, 1140, 1151) ~ "Residential",
+        year == 2001 & LANDUSE %in% c(1250, 1232, 1223, 1222, 1221, 1211, 1212, 1214, 1215, 1216, 1220, 1240, 1250) ~ "Commercial",
+        year == 2001 & LANDUSE %in% c(1310, 1320, 1321, 1322, 1330, 1340, 1350, 1360, 1370, 1380) ~ "Institutional",
+        year == 2001 & LANDUSE %in% c(1410, 1420, 1430, 1431, 1432, 1433, 1440, 1444, 1450) ~ "Industrial",
+        year == 2001 & LANDUSE %in% c(1231, 1511, 1512, 1520, 1530, 1540, 1550, 1560,
+                                      1561, 1562, 1563, 1564, 1565, 1570) ~ "TCU",
+        year == 2001 & LANDUSE %in% c(2000, 2100, 2200, 2300) ~ "Agricultural",
+        year == 2001 & LANDUSE %in% c(3100, 3200, 3300, 3400, 3500, 3600) ~ "OpenSpace",
+        year == 2001 & LANDUSE %in% c(4110, 4120, 4130, 4140, 4210, 4220, 4230, 4240, 4300) ~ "VacUC",
+        year == 2001 & LANDUSE %in% c(5000, 5100, 5200, 6000, 9999) ~ "WaterOther",
+        year == 2010 & LANDUSE %in% c(1110, 1111, 1120, 1112, 1130, 1140, 1151) ~ "Residential",
+        year == 2010 & LANDUSE %in% c(1211, 1212, 1214, 1215, 1216, 1220, 1221, 1222, 1223, 1232, 1240, 1250) ~ "Commercial",
+        year == 2010 & LANDUSE %in% c(1310, 1320, 1321, 1322, 1330, 1340, 1350, 1360, 1370, 1380) ~ "Institutional",
+        year == 2010 & LANDUSE %in% c(1410, 1420, 1430, 1431, 1432, 1433, 1440, 1444, 1450) ~ "Industrial",
+        year == 2010 & LANDUSE %in% c(6300, 1511, 1512, 1520, 1530, 1540, 1550, 1560,
+                                      1561, 1562, 1563, 1564, 1565, 1570) ~ "TCU",
+        year == 2010 & LANDUSE %in% c(2000, 2100, 2200, 2300) ~ "Agricultural",
+        year == 2010 & LANDUSE %in% c(3100, 3200, 3300, 3400, 3500, 3600) ~ "OpenSpace",
+        year == 2010 & LANDUSE %in% c(4110, 4120, 4130, 4140, 4210, 4220, 4230, 4240, 4300) ~ "VacUC",
+        year == 2010 & LANDUSE %in% c(5000, 5100, 5200, 6000, 6100, 6200, 6400, 9999) ~ "WaterOther",
+        year == 2020 & LANDUSE %in% c(1111, 1112, 1130, 1140, 1151) ~ "Residential",
+        year == 2020 & LANDUSE %in% c(1211, 1212, 1214, 1215, 1216, 1220, 1240, 1250) ~ "Commercial",
+        year == 2020 & LANDUSE %in% c(1310, 1321, 1322, 1330, 1340, 1350, 1360, 1370, 1380) ~ "Institutional",
+        year == 2020 & LANDUSE %in% c(1410, 1420, 1431, 1432, 1433, 1450) ~ "Industrial",
+        year == 2020 & LANDUSE %in% c(1511, 1512, 1520, 1530, 1540, 1550, 1561, 1562, 1563, 1564, 1565, 1570) ~ "TCU",
+        year == 2020 & LANDUSE %in% c(2000) ~ "Agricultural",
+        year == 2020 & LANDUSE %in% c(3100, 3200, 3300, 3400, 3500) ~ "OpenSpace",
+        year == 2020 & LANDUSE %in% c(4110, 4120, 4130, 4140, 4210, 4220, 4230, 4240) ~ "VacUC",
+        year == 2020 & LANDUSE %in% c(5000, 6000, 9999) ~ "WaterOther",
+        TRUE ~ NA_character_
+      )
+    )
+}
+run_one <- function(shp_path, year, buffer, resp_prefix, site_id, lu_all, ref_class) {
+  suf <- yr_suffix(year)
+  resp_var <- paste0(resp_prefix, "_", suf)
+  wq_vars <- paste0(
+    c("ammonia","f_coli","phospho","sulfate","sus_sld","TDS","TKN","nitrate","chlorid","chlophl"),
+    "_", suf
+  )
+  dat_sf <- sf::st_read(shp_path, quiet = TRUE)
+  dat_sf <- dplyr::mutate(dat_sf, Area_m2 = as.numeric(sf::st_area(dat_sf)))
+  dat <- sf::st_drop_geometry(dat_sf)
+  dat <- reclass_landuse(dat, year)
+  total_area <- dat %>%
+    group_by(.data[[site_id]]) %>%
+    summarise(TotalArea = sum(Area_m2, na.rm = TRUE), .groups = "drop")
+  dat_pct <- dat %>%
+    filter(!is.na(Land_Use)) %>%
+    group_by(.data[[site_id]], Land_Use) %>%
+    summarise(LU_Area = sum(Area_m2, na.rm = TRUE), .groups = "drop") %>%
+    left_join(total_area, by = setNames(site_id, site_id)) %>%
+    mutate(LU_pct = if_else(TotalArea > 0, 100 * LU_Area / TotalArea, NA_real_)) %>%
+    select(all_of(site_id), Land_Use, LU_pct)
+  dat_lu <- dat_pct %>%
+    pivot_wider(names_from = Land_Use, values_from = LU_pct, values_fill = 0)
+  station_dat <- dat %>%
+    select(all_of(site_id), all_of(resp_var), all_of(wq_vars)) %>%
+    distinct(.data[[site_id]], .keep_all = TRUE)
+  dat_master <- dat_lu %>%
+    left_join(station_dat, by = setNames(site_id, site_id)) %>%
+    drop_na(all_of(resp_var), all_of(wq_vars))
+  lu_vars <- lu_all[lu_all %in% names(dat_master)]
+  lu_vars_model <- setdiff(lu_vars, ref_class)
+  model_cols <- c(resp_var, wq_vars, lu_vars_model)
+  model_df <- dat_master %>%
+    select(all_of(model_cols)) %>%
+    drop_na()
+  model_df <- model_df %>%
+    mutate(across(all_of(c(wq_vars, lu_vars_model)), scale))
+  n_used <- nrow(model_df)
+  zero_prop <- mean(model_df[[resp_var]] == 0)
+  pca <- prcomp(model_df[, wq_vars], center = TRUE, scale. = FALSE)
+  eig <- (pca$sdev)^2
+  prop_var <- eig / sum(eig)
+  cum_var <- cumsum(prop_var)
+  k_kaiser <- sum(eig > 1)
+  k_80 <- which(cum_var >= 0.80)[1]
+  k <- max(k_kaiser, 2)
+  k <- min(k, 5)
+  for (i in 1:k) model_df[[paste0("WQ_PC", i)]] <- pca$x[, i]
+  pc_terms <- paste0("WQ_PC", 1:k)
+  f_wq   <- as.formula(paste(resp_var, "~", paste(pc_terms, collapse = " + ")))
+  f_full <- as.formula(paste(resp_var, "~", paste(c(pc_terms, lu_vars_model), collapse = " + ")))
+  note <- ""
+  fit_type <- "ZINB"
+  m1 <- glmmTMB(formula = f_wq,   ziformula = ~1, family = nbinom2, data = model_df)
+  m2 <- glmmTMB(formula = f_full, ziformula = ~1, family = nbinom2, data = model_df)
+  lrt_try <- safe_lrt_p(m1, m2)
+  if (is_bad_fit(m1) || is_bad_fit(m2) || is.na(lrt_try$p)) {
+    fit_type <- "NB"
+    note <- paste0("ZINB unstable; used NB. ", lrt_try$msg)
+    m1 <- glmmTMB(formula = f_wq,   ziformula = ~0, family = nbinom2, data = model_df)
+    m2 <- glmmTMB(formula = f_full, ziformula = ~0, family = nbinom2, data = model_df)
+    lrt_try <- safe_lrt_p(m1, m2)
+    if (is.na(lrt_try$p)) {
+      note <- paste0(note, " | NB anova also failed: ", lrt_try$msg)
+    }
+  }
+  lrt_p <- lrt_try$p
+  r2_out <- tryCatch(
+    partial_pseudo_r2(m1, m2),
+    error = function(e) list(r2 = NA_real_, ll_reduced = NA_real_, ll_full = NA_real_)
+  )
+  aic_red  <- tryCatch(AIC(m1), error = function(e) NA_real_)
+  aic_full <- tryCatch(AIC(m2), error = function(e) NA_real_)
+  tibble(
+    Year = year,
+    Buffer = buffer,
+    Response = resp_prefix,
+    ResponseVar = resp_var,
+    N = n_used,
+    ZeroProp = zero_prop,
+    k_Kaiser = k_kaiser,
+    k_80pct = k_80,
+    k_Used = k,
+    FitType = fit_type,
+    LRT_p = lrt_p,
+    PartialPseudoR2_LU_given_WQ = r2_out$r2,
+    logLik_Reduced = r2_out$ll_reduced,
+    logLik_Full = r2_out$ll_full,
+    AIC_Reduced = aic_red,
+    AIC_Full = aic_full,
+    RefClass = ref_class,
+    Note = note,
+    ShpPath = shp_path
+  )
+}
+results <- list()
+idx <- 1
+for (y in years) {
+  for (b in buffers) {
+    shp_path <- build_path(base_dir, b, y)
+    for (r in responses) {
+      cat("Running:", y, b, r, " | file:", shp_path, "\n")
+      out <- tryCatch(
+        run_one(shp_path, y, b, r, site_id, lu_all, ref_class),
+        error = function(e) {
+          tibble(
+            Year = y, Buffer = b, Response = r,
+            ResponseVar = paste0(r, "_", yr_suffix(y)),
+            N = NA_integer_, ZeroProp = NA_real_,
+            k_Kaiser = NA_integer_, k_80pct = NA_integer_, k_Used = NA_integer_,
+            FitType = NA_character_, LRT_p = NA_real_,
+            PartialPseudoR2_LU_given_WQ = NA_real_,
+            logLik_Reduced = NA_real_, logLik_Full = NA_real_,
+            AIC_Reduced = NA_real_, AIC_Full = NA_real_,
+            RefClass = ref_class,
+            Note = paste("ERROR:", conditionMessage(e)),
+            ShpPath = shp_path
+          )
+        }
+      )
+      results[[idx]] <- out
+      idx <- idx + 1
+    }
+  }
+}
+summary_table <- bind_rows(results)
+summary_table_clean <- summary_table %>%
+  mutate(
+    ZeroProp = round(ZeroProp, 4),
+    LRT_p = signif(LRT_p, 3),
+    PartialPseudoR2_LU_given_WQ = round(PartialPseudoR2_LU_given_WQ, 4),
+    AIC_Reduced = round(AIC_Reduced, 1),
+    AIC_Full = round(AIC_Full, 1)
+  ) %>%
+  arrange(Year, Buffer, Response)
+print(summary_table_clean, n = nrow(summary_table_clean))
+write.csv(summary_table_clean, file.path(base_dir, "LU_WQ_models_summary_table2.csv"), row.names = FALSE)
