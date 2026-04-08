@@ -1,0 +1,109 @@
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+})
+input_shp <- "G:/.../WQ_FISH_DATA_COMBO.shp"
+out_dir   <- "D:/OUTPUT"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+wq_sf <- st_read(input_shp, quiet = TRUE)
+wq_df <- st_drop_geometry(wq_sf)
+wq_sf$row_id <- seq_len(nrow(wq_df))
+wq_df$row_id <- wq_sf$row_id
+year_idx <- sprintf("%02d", 1:25)
+idx_to_year <- setNames(2001:2025, year_idx)
+all_cols <- names(wq_df)
+suffix_cols <- all_cols[str_detect(all_cols, "_\\d{2}$")]
+prefixes <- unique(str_replace(suffix_cols, "_\\d{2}$", ""))
+exclude_prefixes <- c("FishCo", "SpeCo")
+wq_prefixes <- setdiff(prefixes, exclude_prefixes)
+cat("\nDetected WQ prefixes available for PCA:\n")
+print(wq_prefixes)
+log_prefixes <- intersect(wq_prefixes, c("ammonia","nitrate","phospho","TKN","f_coli","chlophl","sus_sld"))
+safe_log1p <- function(x) {
+  x <- as.numeric(x)
+  x[x < 0] <- NA_real_
+  log1p(x)
+}
+scores_list <- list()
+for (idx in year_idx) {
+  yr <- idx_to_year[[idx]]
+  cols_this <- paste0(wq_prefixes, "_", idx)
+  cols_this <- cols_this[cols_this %in% all_cols]
+  if (length(cols_this) < 3) {
+    message("Skipping year ", yr, " (fewer than 3 PCA variables found).")
+    next
+  }
+  X <- wq_df[, cols_this, drop = FALSE] %>%
+    mutate(across(everything(), as.numeric))
+  for (p in log_prefixes) {
+    nm <- paste0(p, "_", idx)
+    if (nm %in% names(X)) X[[nm]] <- safe_log1p(X[[nm]])
+  }
+  keep <- complete.cases(X)
+  Xk <- X[keep, , drop = FALSE]
+  if (nrow(Xk) < 5) {
+    message("Skipping year ", yr, " (too few complete rows after NA removal).")
+    next
+  }
+  pca <- prcomp(Xk, center = TRUE, scale. = TRUE)
+  eigenvalues <- pca$sdev^2
+  eigen_df <- data.frame(
+    Year = yr,
+    PC = paste0("PC", seq_along(eigenvalues)),
+    Eigenvalue = as.numeric(eigenvalues)
+  )
+  write_csv(eigen_df, file.path(out_dir, paste0("PCA_eigenvalues_", yr, ".csv")))
+  var_exp <- eigenvalues / sum(eigenvalues)
+  var_df <- data.frame(
+    Year = yr,
+    PC = paste0("PC", seq_along(var_exp)),
+    StdDev = as.numeric(pca$sdev),
+    Eigenvalue = as.numeric(eigenvalues),
+    VarExplained = as.numeric(var_exp),
+    CumVarExplained = as.numeric(cumsum(var_exp))
+  )
+  write_csv(var_df, file.path(out_dir, paste0("PCA_variance_", yr, ".csv")))
+  load_df <- as.data.frame(pca$rotation)
+  load_df$Variable <- rownames(load_df)
+  load_df <- load_df %>% relocate(Variable)
+  write_csv(load_df, file.path(out_dir, paste0("PCA_loadings_", yr, ".csv")))
+  score_df <- as.data.frame(pca$x)
+  score_df$row_id <- wq_df$row_id[keep]
+  score_df$Year <- yr
+  write_csv(score_df, file.path(out_dir, paste0("PCA_scores_", yr, ".csv")))
+  scree <- ggplot(var_df, aes(x = PC, y = VarExplained)) +
+    geom_col() +
+    theme_bw() +
+    labs(
+      title = paste0("Scree Plot (", yr, ")"),
+      y = "Proportion Variance Explained",
+      x = NULL
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(
+    filename = file.path(out_dir, paste0("PCA_scree_", yr, ".png")),
+    plot = scree, width = 8, height = 5, dpi = 300
+  )
+  keep_scores <- score_df %>%
+    select(row_id, PC1, PC2) %>%
+    rename(
+      !!paste0("WQ_PC1_", yr) := PC1,
+      !!paste0("WQ_PC2_", yr) := PC2
+    )
+  scores_list[[as.character(yr)]] <- keep_scores
+  message("Finished PCA for year ", yr, " | n_complete=", nrow(Xk), " | p=", ncol(Xk))
+}
+wq_out <- wq_sf
+for (yr in names(scores_list)) {
+  wq_out <- wq_out %>% left_join(scores_list[[yr]], by = "row_id")
+}
+out_gpkg <- file.path(out_dir, "WQ_FISH_with_WQ_PCA_SCORES.gpkg")
+st_write(wq_out, out_gpkg, delete_dsn = TRUE, quiet = TRUE)
+cat("\n=====================================\n")
+cat("DONE: PCA + Eigenvalues saved for 2001–2025\n")
+cat("Outputs folder:\n", out_dir, "\n", sep = "")
+cat("Spatial output:\n", out_gpkg, "\n", sep = "")
+cat("=====================================\n")
