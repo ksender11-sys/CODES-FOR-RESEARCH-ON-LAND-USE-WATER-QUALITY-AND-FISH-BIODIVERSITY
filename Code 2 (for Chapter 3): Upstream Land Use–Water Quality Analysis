@@ -1,0 +1,964 @@
+library(terra)
+library(ranger)
+ws_path <- "E:/.../WaterShed.shp"
+terrain_stack_file <- "E:/.../TerrainHydro_stack_utm16.tif"
+landcover_files <- list(
+  "2004" = "E:/.../nlcd_2004_land_cover_l48_20210604.img",
+  "2006" = "E:/.../nlcd_2006_land_cover_l48_20210604.img",
+  "2011" = "E:/.../nlcd_2011_land_cover_l48_20210604.img",
+  "2016" = "E:/.../nlcd_2016_land_cover_l48_20210604.img",
+  "2019" = "E:/.../nlcd_2019_land_cover_l48_20210604.img"
+)
+landuse_vec_files <- list(
+  "2001" = "E:/.../2001.shp",
+  "2005" = "E:/.../2005.shp",
+  "2010" = "E:/.../2010.shp",
+  "2015" = "E:/.../2015.shp",
+  "2020" = "E:/.../2020.shp"
+)
+pair_map <- c("2001"="2004", "2005"="2006", "2010"="2011", "2015"="2016", "2020"="2019")
+out_dir <- "E:/.../LU_PREDICTED_WATERSHED"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+set.seed(1)
+max_train   <- 250000
+n_trees     <- 500
+block_nrows <- 256
+num_threads <- 1
+RUN_ID <- format(Sys.time(), "%Y%m%d_%H%M%S")
+tmp_dir <- file.path(out_dir, "terra_tmp")
+dir.create(tmp_dir, showWarnings = FALSE, recursive = TRUE)
+terraOptions(tempdir = tmp_dir, memfrac = 0.6, progress = 10)
+LU_LEVELS <- c("Residential","Commercial","Institutional","Industrial",
+               "TCU","Agricultural","OpenSpace","VacUC","WaterOther")
+write.csv(
+  data.frame(id = seq_along(LU_LEVELS), class = LU_LEVELS),
+  file.path(out_dir, paste0("LandUseClassLegend_", RUN_ID, ".csv")),
+  row.names = FALSE
+)
+clip_to_ws <- function(r, ws) {
+  ws2 <- terra::project(ws, terra::crs(r))
+  terra::mask(terra::crop(r, ws2), ws2)
+}
+align_to_template <- function(r, template, method="near") {
+  r2 <- terra::project(r, template, method = method)
+  terra::resample(r2, template, method = method)
+}
+get_landuse_field <- function(v) {
+  prefs <- c("LANDUSE","LandUse","landuse","LU","LU_CODE","LUCODE","CLASS","Class","CATEGORY","Category")
+  cn <- names(v)
+  hit <- prefs[prefs %in% cn]
+  if (length(hit) > 0) return(hit[1])
+  if (length(cn) == 0) stop("No attributes found in land-use shapefile.")
+  cn[1]
+}
+get_attr_vec <- function(v, field) {
+  x <- v[[field]]
+  if (is.list(x)) x <- unlist(x, use.names = FALSE)
+  if (is.null(x) || length(x) == 0) {
+    x <- terra::values(v)[[field]]
+    if (is.list(x)) x <- unlist(x, use.names = FALSE)
+  }
+  x
+}
+safe_write_unique <- function(r, base_name, datatype=NULL) {
+  f <- file.path(out_dir, paste0(base_name, "_", RUN_ID, ".tif"))
+  if (is.null(datatype)) {
+    terra::writeRaster(r, f, overwrite = TRUE)
+  } else {
+    terra::writeRaster(r, f, overwrite = TRUE, datatype = datatype)
+  }
+  terra::rast(f)
+}
+recode_landuse <- function(year, code) {
+  code <- as.integer(code)
+  out <- rep(NA_character_, length(code))
+  if (year == 2001) {
+    out[code %in% c(1110,1111,1120,1112,1130,1140,1151)] <- "Residential"
+    out[code %in% c(1250,1232,1223,1222,1221,1211,1212,1214,1215,1216,1220,1240,1250)] <- "Commercial"
+    out[code %in% c(1310,1320,1321,1322,1330,1340,1350,1360,1370,1380)] <- "Institutional"
+    out[code %in% c(1410,1420,1430,1431,1432,1433,1440,1444,1450)] <- "Industrial"
+    out[code %in% c(1231,1511,1512,1520,1530,1540,1550,1560,1561,1562,1563,1564,1565,1570)] <- "TCU"
+    out[code %in% c(2000,2100,2200,2300)] <- "Agricultural"
+    out[code %in% c(3100,3200,3300,3400,3500,3600)] <- "OpenSpace"
+    out[code %in% c(4110,4120,4130,4140,4210,4220,4230,4240,4300)] <- "VacUC"
+    out[code %in% c(5000,5100,5200,5300,6000,6100,6200,6300,6400,9999)] <- "WaterOther"
+  }
+  if (year == 2005) {
+    out[code %in% c(1110,1111,1112,1120,1130,1140,1151)] <- "Residential"
+    out[code %in% c(1211,1212,1214,1215,1216,1220,1221,1222,1223,1231,1232,1240,1250)] <- "Commercial"
+    out[code %in% c(1310,1320,1321,1322,1330,1340,1350,1360,1370,1380)] <- "Institutional"
+    out[code %in% c(1410,1420,1430,1431,1432,1433,1440,1444,1450)] <- "Industrial"
+    out[code %in% c(1511,1512,1520,1530,1540,1550,1560,1561,1562,1563,1564,1565,1570)] <- "TCU"
+    out[code %in% c(2000,2100,2200,2300)] <- "Agricultural"
+    out[code %in% c(3100,3200,3300,3400,3500,3600)] <- "OpenSpace"
+    out[code %in% c(4110,4120,4130,4140,4210,4220,4230,4240,4300)] <- "VacUC"
+    out[code %in% c(5000,5100,5200,5300,6000,6100,6200,6300,6400,9999)] <- "WaterOther"
+  }
+  if (year == 2010) {
+    out[code %in% c(1110,1111,1120,1112,1130,1140,1151)] <- "Residential"
+    out[code %in% c(1211,1212,1214,1215,1216,1220,1221,1222,1223,1232,1240,1250)] <- "Commercial"
+    out[code %in% c(1310,1320,1321,1322,1330,1340,1350,1360,1370,1380)] <- "Institutional"
+    out[code %in% c(1410,1420,1430,1431,1432,1433,1440,1444,1450)] <- "Industrial"
+    out[code %in% c(6300,1511,1512,1520,1530,1540,1550,1560,1561,1562,1563,1564,1565,1570)] <- "TCU"
+    out[code %in% c(2000,2100,2200,2300)] <- "Agricultural"
+    out[code %in% c(3100,3200,3300,3400,3500,3600)] <- "OpenSpace"
+    out[code %in% c(4110,4120,4130,4140,4210,4220,4230,4240,4300)] <- "VacUC"
+    out[code %in% c(5000,5100,5200,6000,6100,6200,6400,9999)] <- "WaterOther"
+  }
+  if (year == 2015) {
+    out[code %in% c(1111,1112,1130,1140,1151)] <- "Residential"
+    out[code %in% c(1211,1212,1214,1215,1216,1220,1240,1250)] <- "Commercial"
+    out[code %in% c(1310,1321,1322,1330,1340,1350,1360,1370,1380)] <- "Institutional"
+    out[code %in% c(1410,1420,1431,1432,1433,1450)] <- "Industrial"
+    out[code %in% c(1511,1512,1520,1530,1540,1550,1561,1562,1563,1564,1565,1570)] <- "TCU"
+    out[code %in% c(2000)] <- "Agricultural"
+    out[code %in% c(3100,3200,3300,3400,3500)] <- "OpenSpace"
+    out[code %in% c(4110,4120,4130,4140,4210,4220,4230,4240)] <- "VacUC"
+    out[code %in% c(5000,6000,9999)] <- "WaterOther"
+  }
+  if (year == 2020) {
+    out[code %in% c(1111,1112,1130,1140,1151)] <- "Residential"
+    out[code %in% c(1211,1212,1214,1215,1216,1220,1240,1250)] <- "Commercial"
+    out[code %in% c(1310,1321,1322,1330,1340,1350,1360,1370,1380)] <- "Institutional"
+    out[code %in% c(1410,1420,1431,1432,1433,1450)] <- "Industrial"
+    out[code %in% c(1511,1512,1520,1530,1540,1550,1561,1562,1563,1564,1565,1570)] <- "TCU"
+    out[code %in% c(2000)] <- "Agricultural"
+    out[code %in% c(3100,3200,3300,3400,3500)] <- "OpenSpace"
+    out[code %in% c(4110,4120,4130,4140,4210,4220,4230,4240)] <- "VacUC"
+    out[code %in% c(5000,6000,9999)] <- "WaterOther"
+  }
+  out
+}
+predict_ranger_blocks <- function(X_disk, model, out_file,
+                                 gap01_disk = NULL,
+                                 block_nrows = 256,
+                                 lc_levels = NULL,
+                                 num_threads = 1) {
+  terra::readStart(X_disk)
+  if (!is.null(gap01_disk)) terra::readStart(gap01_disk)
+  nr_total <- terra::nrow(X_disk)
+  nc_total <- terra::ncol(X_disk)
+  if (length(nr_total) != 1 || is.na(nr_total)) stop("Bad nrow(X_disk).")
+  if (length(nc_total) != 1 || is.na(nc_total)) stop("Bad ncol(X_disk).")
+  starts <- seq.int(1L, nr_total, by = as.integer(block_nrows))
+  n_blocks <- length(starts)
+  pred <- terra::rast(X_disk[[1]])
+  terra::values(pred) <- NA_integer_
+  names(pred) <- "pred"
+  terra::writeStart(pred, filename = out_file, overwrite = TRUE, datatype = "INT2S")
+  b <- 0L
+  for (r0 in starts) {
+    b <- b + 1L
+    nr <- min(block_nrows, nr_total - r0 + 1L)
+    Xv  <- terra::readValues(X_disk, row = r0, nrows = nr, mat = TRUE)
+    out <- rep(NA_integer_, nrow(Xv))  # nr * ncol
+    if (is.null(gap01_disk)) {
+      ok <- which(complete.cases(Xv))
+    } else {
+      gv <- terra::readValues(gap01_disk, row = r0, nrows = nr, mat = FALSE)
+      need <- which(gv == 1)
+      ok <- need[complete.cases(Xv[need, , drop = FALSE])]
+    }
+    if (length(ok) > 0) {
+      d <- data.frame(
+        landcover     = Xv[ok, 1],
+        elevation_m   = Xv[ok, 2],
+        slope_deg     = Xv[ok, 3],
+        flowacc_cells = Xv[ok, 4],
+        twi           = Xv[ok, 5]
+      )
+      d$landcover <- if (!is.null(lc_levels)) factor(d$landcover, levels = lc_levels) else factor(d$landcover)
+      p <- predict(model, data = d, num.threads = num_threads)$predictions
+      p_int <- suppressWarnings(as.integer(as.character(p)))
+      if (all(is.na(p_int))) p_int <- as.integer(p)
+      out[ok] <- p_int
+    }
+    # ✅ KEY FIX: start is ROW index in your terra build (not a cell index)
+    terra::writeValues(pred, out, r0, nr)
+
+    if (b %% 5L == 0L) cat("  block", b, "of", n_blocks, "\n")
+  }
+  pred <- terra::writeStop(pred)
+  terra::readStop(X_disk)
+  if (!is.null(gap01_disk)) terra::readStop(gap01_disk)
+  terra::rast(out_file)
+}
+ws <- terra::vect(ws_path)
+terrain_full <- terra::rast(terrain_stack_file)
+names(terrain_full) <- c("elevation_m","slope_deg","flowacc_cells","twi")
+terrain0 <- clip_to_ws(terrain_full, ws)
+terrain  <- safe_write_unique(terrain0, "TerrainHydro_stack_utm16_CLIPPED", datatype = "FLT4S")
+rm(terrain0, terrain_full); gc()
+cat("\nTemplate:\n"); print(terrain)
+for (lu_year in names(pair_map)) {
+  lc_year <- pair_map[[lu_year]]
+  yr_int  <- as.integer(lu_year)
+  cat("\n=================================================\n")
+  cat("LAND USE YEAR:", lu_year, " | LAND COVER YEAR:", lc_year, "\n")
+  cat("RUN_ID:", RUN_ID, "\n")
+  cat("=================================================\n")
+  lc0 <- terra::rast(landcover_files[[lc_year]])
+  lc0 <- align_to_template(lc0, terrain[[1]], method = "near")
+  lc0 <- terra::mask(lc0, terrain[[1]])
+  names(lc0) <- "landcover"
+  lc  <- safe_write_unique(lc0, paste0("LandCover_", lc_year, "_aligned"), datatype = "INT2U")
+  rm(lc0); gc()
+  lu_vec <- terra::vect(landuse_vec_files[[lu_year]])
+  lu_vec <- terra::project(lu_vec, terra::crs(terrain))
+  lu_code_field <- get_landuse_field(lu_vec)
+  cat("Using land-use code field:", lu_code_field, "\n")
+  lu_codes <- suppressWarnings(as.integer(as.character(get_attr_vec(lu_vec, lu_code_field))))
+  lu_grp   <- recode_landuse(yr_int, lu_codes)
+  lu_id    <- as.integer(factor(lu_grp, levels = LU_LEVELS))
+  lu_vec$LU_ID <- lu_id
+  lu_r0 <- terra::rasterize(lu_vec, terrain[[1]], field = "LU_ID", touches = TRUE)
+  lu_r0 <- terra::mask(lu_r0, terrain[[1]])
+  names(lu_r0) <- "landuse_id"
+  labeled <- terra::global(!is.na(lu_r0), "sum", na.rm = TRUE)[1,1]
+  cat("Labeled cells:", labeled, "out of", terra::ncell(lu_r0), "\n")
+  lu_r <- safe_write_unique(lu_r0, paste0("LandUse_labels_id_", lu_year, "_template"), datatype = "INT2S")
+  rm(lu_r0, lu_vec); gc()
+  X0 <- c(lc, terrain)
+  names(X0) <- c("landcover","elevation_m","slope_deg","flowacc_cells","twi")
+  X  <- safe_write_unique(X0, paste0("Predictors_X_", lu_year), datatype = "FLT4S")
+  rm(X0); gc()
+  idx_all <- which(!is.na(terra::values(lu_r, mat = FALSE)))
+  if (length(idx_all) == 0) stop("No labeled pixels for ", lu_year)
+  s_idx <- sample(idx_all, min(max_train, length(idx_all)))
+  pts   <- terra::vect(terra::xyFromCell(terrain[[1]], s_idx), crs = terra::crs(terrain))
+  lc_vals  <- terra::extract(lc, pts)[, -1, drop = FALSE]
+  ter_vals <- terra::extract(terrain, pts)[, -1, drop = FALSE]
+  y_vals   <- terra::values(lu_r)[s_idx]
+  names(lc_vals)  <- "landcover"
+  names(ter_vals) <- c("elevation_m","slope_deg","flowacc_cells","twi")
+  df <- data.frame(
+    landcover  = factor(lc_vals$landcover),
+    ter_vals,
+    landuse_id = factor(y_vals)
+  )
+  df <- na.omit(df)
+  cat("Training samples used:", nrow(df), " | classes:", length(unique(df$landuse_id)), "\n")
+  if (nrow(df) < 1000) stop("Too few training rows for ", lu_year)
+  lc_levels <- levels(df$landcover)
+  model <- ranger(
+    landuse_id ~ .,
+    data = df,
+    num.trees = n_trees,
+    importance = "impurity",
+    probability = FALSE,
+    num.threads = num_threads
+  )
+  gap01 <- safe_write_unique(
+    terra::ifel(is.na(lu_r), 1, 0),
+    paste0("GAP01_", lu_year),
+    datatype = "INT1U"
+  )
+  pred_gap_file <- file.path(out_dir, paste0("LandUse_pred_id_", lu_year, "_GAPS_", RUN_ID, ".tif"))
+  cat("Predicting gaps (manual blocks) ...\n")
+  pred_gaps <- predict_ranger_blocks(
+    X_disk      = X,
+    model       = model,
+    out_file    = pred_gap_file,
+    gap01_disk  = gap01,
+    block_nrows = block_nrows,
+    lc_levels   = lc_levels,
+    num_threads = num_threads
+  )
+  pred_full <- terra::cover(lu_r, pred_gaps)
+  names(pred_full) <- paste0("LU_pred_id_", lu_year)
+  pred_full <- safe_write_unique(
+    pred_full,
+    paste0("LandUse_pred_id_", lu_year, "_WATERSHED"),
+    datatype = "INT2S"
+  )
+  cat("Saved gaps-only :", pred_gap_file, "\n")
+  cat("Saved full pred :", terra::sources(pred_full), "\n")
+  cat("Saved labels    :", terra::sources(lu_r), "\n")
+
+  rm(df, model, pred_gaps, pred_full, gap01, X, lc, lu_r, pts, lc_vals, ter_vals, y_vals)
+  gc()
+}
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+  library(tidyr)
+})
+wq_shp     <- "G:/.../WQ_FISH_DATA_COMBO.shp"
+stream_shp <- "D:/.../Stream_Clipped.shp"
+dem_path   <- "D:/.../DEM_mosaic.tif"
+lu_files <- list(
+  "2001" = "D:/.../LandUse_pred_id_2001_WATERSHED_20260216_145453.tif",
+  "2005" = "D:/.../LandUse_pred_id_2005_WATERSHED_20260216_145453.tif",
+  "2010" = "D:/.../LandUse_pred_id_2010_WATERSHED_20260216_145453.tif",
+  "2015" = "D:/.../LandUse_pred_id_2015_WATERSHED_20260216_145453.tif",
+  "2020" = "D:/.../LandUse_pred_id_2020_WATERSHED_20260216_145453.tif"
+)
+site_id    <- "Name"
+target_crs <- "EPSG:32616"
+LU_LEVELS <- c("Residential","Commercial","Institutional","Industrial",
+               "TCU","Agricultural","OpenSpace","VacUC","WaterOther")
+out_dir <- "D:/THESIS DATA ANALYSIS/LAND USE/UPSTREAM_LU_RESULTS/LEGACY_LU_WQ_STREAM"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+STREAM_BUFFER_M   <- 3000   
+BURN_DEPTH_M      <- 5      
+POUR_SNAP_DIST_M  <- 300    
+BREACH_DIST_M     <- 500    
+STATION_SNAP_MAXM <- 10000  
+if (!file.exists(wq_shp))     stop("wq_shp not found: ", wq_shp)
+if (!file.exists(stream_shp)) stop("stream_shp not found: ", stream_shp)
+if (!file.exists(dem_path))   stop("dem_path not found: ", dem_path)
+lu_paths <- unlist(lu_files, use.names = FALSE)   # FIX: list -> character vector
+missing_lu <- names(lu_files)[!file.exists(lu_paths)]
+if (length(missing_lu) > 0) {
+  stop(
+    "Missing LU raster(s) for year(s): ", paste(missing_lu, collapse = ", "),
+    "\nCheck these paths:\n- ",
+    paste(unlist(lu_files[missing_lu], use.names = FALSE), collapse = "\n- ")
+  )
+}
+wq <- st_read(wq_shp, quiet = TRUE)
+if (!(site_id %in% names(wq))) stop("Missing site_id field: ", site_id)
+streams <- st_read(stream_shp, quiet = TRUE)
+if (nrow(streams) == 0) stop("0 features in Stream_Clipped.shp")
+wq_utm      <- st_transform(wq, target_crs)      |> st_zm(drop = TRUE, what = "ZM")
+streams_utm <- st_transform(streams, target_crs) |> st_zm(drop = TRUE, what = "ZM")
+wq_utm      <- wq_utm[!st_is_empty(wq_utm), , drop = FALSE]
+streams_utm <- streams_utm[!st_is_empty(streams_utm), , drop = FALSE]
+gtype <- unique(as.character(st_geometry_type(streams_utm)))
+if (any(gtype %in% c("POLYGON","MULTIPOLYGON"))) streams_utm <- st_boundary(streams_utm)
+streams_ls <- st_cast(streams_utm, "LINESTRING", warn = FALSE)
+streams_ls <- streams_ls[!st_is_empty(streams_ls), , drop = FALSE]
+if (nrow(streams_ls) == 0) stop("No LINESTRING streams after casting.")
+stations <- wq_utm |> dplyr::select(all_of(site_id)) |> mutate(PID = row_number())
+nearest_point_on_line_robust <- function(points_sf, lines_sf) {
+  idx <- sf::st_nearest_feature(points_sf, lines_sf)
+  snapped_sfg <- vector("list", nrow(points_sf))
+  snap_dist_m <- numeric(nrow(points_sf))
+  for (i in seq_len(nrow(points_sf))) {
+    li  <- lines_sf[idx[i], ]
+    seg <- sf::st_nearest_points(points_sf[i, ], li)
+    pts <- sf::st_cast(seg, "POINT")
+    npts <- length(pts)
+    if (npts >= 2)      p_on_line <- pts[[npts]]
+    else if (npts == 1) p_on_line <- pts[[1]]
+    else                p_on_line <- sf::st_geometry(points_sf[i, ])[[1]]
+    snapped_sfg[[i]] <- p_on_line
+    p_sf <- sf::st_as_sf(sf::st_sfc(p_on_line, crs = sf::st_crs(points_sf)))
+    snap_dist_m[i] <- as.numeric(sf::st_distance(points_sf[i, ], p_sf, by_element = TRUE))
+  }
+  out <- points_sf
+  st_geometry(out) <- st_sfc(snapped_sfg, crs = st_crs(points_sf))
+  out$SNAP_DIST_M <- snap_dist_m
+  out
+}
+cat("Snapping stations to Stream_Clipped...\n")
+stations_stream <- nearest_point_on_line_robust(stations, streams_ls)
+cat("Station->stream snap distance summary (m):\n")
+print(summary(stations_stream$SNAP_DIST_M))
+stations_stream <- stations_stream |> filter(SNAP_DIST_M <= STATION_SNAP_MAXM)
+if (nrow(stations_stream) == 0) {
+  stop("All stations dropped by STATION_SNAP_MAXM. Increase threshold or check Stream_Clipped coverage.")
+}
+st_write(
+  stations_stream,
+  file.path(out_dir, "stations_snapped_to_StreamClipped.gpkg"),
+  layer = "stations_stream_snapped",
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+dem <- rast(dem_path)
+target_wkt <- sf::st_crs(target_crs)$wkt
+
+if (!isTRUE(terra::crs(dem) == target_wkt)) {
+  cat("Projecting DEM to", target_crs, "(heavy the first time)...\n")
+  dem <- terra::project(dem, target_wkt, method = "bilinear")
+}
+stream_buf   <- st_buffer(streams_ls, STREAM_BUFFER_M) |> st_union()
+stream_buf_v <- vect(stream_buf)
+dem_clip <- dem |> terra::crop(stream_buf_v) |> terra::mask(stream_buf_v)
+wbt_dir <- file.path(out_dir, "WBT_WORK")
+dir.create(wbt_dir, showWarnings = FALSE, recursive = TRUE)
+dem_local <- file.path(wbt_dir, "dem_clipped.tif")
+writeRaster(dem_clip, dem_local, overwrite = TRUE)
+streams_local <- file.path(wbt_dir, "streams.gpkg")
+st_write(streams_ls, streams_local, delete_dsn = TRUE, quiet = TRUE)
+stations_pour <- stations_stream |>
+  dplyr::select(PID, all_of(site_id)) |>
+  st_zm(drop = TRUE, what = "ZM")
+
+pour_points_shp <- file.path(wbt_dir, "pour_points.shp")
+unlink(list.files(wbt_dir, "pour_points.*", full.names = TRUE))
+st_write(stations_pour, pour_points_shp, quiet = TRUE)
+if (!requireNamespace("whitebox", quietly = TRUE)) install.packages("whitebox")
+library(whitebox)
+dem_burn   <- file.path(wbt_dir, "dem_burned.tif")
+dem_breach <- file.path(wbt_dir, "dem_breached.tif")
+dem_fill   <- file.path(wbt_dir, "dem_filled.tif")
+d8_ptr     <- file.path(wbt_dir, "d8_pointer.tif")
+d8_acc     <- file.path(wbt_dir, "d8_accum.tif")
+pour_snapped <- file.path(wbt_dir, "pour_snapped.shp")
+wshed_ras    <- file.path(wbt_dir, "watersheds.tif")
+wshed_shp    <- file.path(wbt_dir, "watersheds_poly.shp")
+cat("Whitebox: burning streams into DEM (try/fallback)...\n")
+burn_ok <- FALSE
+try({
+  whitebox::wbt_burn_streams_into_dem(
+    dem = dem_local,
+    streams = streams_local,
+    output = dem_burn,
+    burn_depth = BURN_DEPTH_M
+  )
+  burn_ok <- TRUE
+}, silent = TRUE)
+if (!burn_ok) {
+  try({
+    whitebox::wbt_burn_streams_at_roads(
+      dem = dem_local,
+      streams = streams_local,
+      output = dem_burn,
+      burn_depth = BURN_DEPTH_M
+    )
+    burn_ok <- TRUE
+  }, silent = TRUE)
+}
+if (!burn_ok) {
+  warning("Stream burning failed in this WBT build. Proceeding WITHOUT burning.")
+  file.copy(dem_local, dem_burn, overwrite = TRUE)
+} else {
+  cat("Stream burning succeeded.\n")
+}
+cat("Whitebox: breaching depressions (least-cost)...\n")
+breach_ok <- FALSE
+dem_for_fill <- dem_burn
+try({
+  whitebox::wbt_breach_depressions_least_cost(
+    dem = dem_burn,
+    output = dem_breach,
+    dist = BREACH_DIST_M
+  )
+  breach_ok <- TRUE
+  dem_for_fill <- dem_breach
+}, silent = TRUE)
+if (!breach_ok) {
+  warning("Breach depressions failed. Proceeding with fill-only.")
+  dem_for_fill <- dem_burn
+}
+cat("Whitebox: filling depressions (Wang & Liu)...\n")
+try({
+  whitebox::wbt_fill_depressions_wang_and_liu(dem = dem_for_fill, output = dem_fill)
+}, silent = TRUE)
+if (!file.exists(dem_fill)) {
+  warning("fill_depressions_wang_and_liu failed. Falling back to fill_depressions.")
+  whitebox::wbt_fill_depressions(dem_for_fill, dem_fill)
+}
+if (!file.exists(dem_fill)) stop("DEM conditioning failed: dem_filled.tif was not created.")
+cat("Whitebox: D8 pointer...\n")
+whitebox::wbt_d8_pointer(dem_fill, d8_ptr)
+if (!file.exists(d8_ptr)) stop("D8 pointer failed: d8_pointer.tif not created.")
+cat("Whitebox: flow accumulation...\n")
+whitebox::wbt_d8_flow_accumulation(d8_ptr, d8_acc, out_type = "cells")
+if (!file.exists(d8_acc)) stop("Flow accumulation failed: d8_accum.tif not created.")
+cat("Whitebox: snapping pour points to flow accumulation...\n")
+whitebox::wbt_snap_pour_points(
+  pour_pts   = pour_points_shp,
+  flow_accum = d8_acc,
+  output     = pour_snapped,
+  snap_dist  = POUR_SNAP_DIST_M
+)
+if (!file.exists(pour_snapped)) stop("SnapPourPoints failed: pour_snapped.shp not created.")
+cat("Whitebox: watershed delineation...\n")
+whitebox::wbt_watershed(
+  d8_pntr  = d8_ptr,
+  pour_pts = pour_snapped,
+  output   = wshed_ras
+)
+if (!file.exists(wshed_ras)) stop("Watershed failed: watersheds.tif not created.")
+cat("Whitebox: raster -> vector polygons...\n")
+unlink(list.files(wbt_dir, "watersheds_poly.*", full.names = TRUE))
+whitebox::wbt_raster_to_vector_polygons(input = wshed_ras, output = wshed_shp)
+if (!file.exists(wshed_shp)) stop("RasterToVectorPolygons failed: watersheds_poly.shp not created.")
+watersheds_raw <- st_read(wshed_shp, quiet = TRUE) |>
+  st_transform(target_crs) |>
+  st_make_valid()
+pour_pts_snapped <- st_read(pour_snapped, quiet = TRUE) |>
+  st_transform(target_crs) |>
+  st_make_valid()
+if (!("PID" %in% names(pour_pts_snapped))) {
+  df0 <- st_drop_geometry(pour_pts_snapped)
+  int_cols <- names(df0)[sapply(df0, function(x) is.integer(x) || is.numeric(x))]
+  if (length(int_cols) > 0) {
+    pour_pts_snapped <- pour_pts_snapped |> mutate(PID = as.integer(.data[[int_cols[1]]]))
+  } else {
+    stop("Could not find PID field in snapped pour points: ", pour_snapped)
+  }
+}
+pour_small <- pour_pts_snapped |> dplyr::select(any_of(c("PID", site_id)))
+watersheds <- st_join(watersheds_raw, pour_small, join = st_intersects, left = TRUE)
+miss <- which(is.na(watersheds$PID))
+if (length(miss) > 0) {
+  idx_near <- st_nearest_feature(watersheds_raw[miss, ], pour_small)
+  watersheds$PID[miss] <- pour_small$PID[idx_near]
+  if (site_id %in% names(pour_small)) {
+    watersheds[[site_id]][miss] <- pour_small[[site_id]][idx_near]
+  }
+  warning(length(miss), " watershed polygon(s) were missing PID after join; filled using nearest pour point.")
+}
+watersheds_out_shp <- file.path(out_dir, "watersheds_with_pid.shp")
+unlink(list.files(out_dir, "watersheds_with_pid.*", full.names = TRUE))
+st_write(watersheds, watersheds_out_shp, quiet = TRUE)
+ld type for FID")
+watersheds_gpkg <- file.path(out_dir, "upstream_watersheds.gpkg")
+watersheds_gpkg_layer <- "watersheds_with_pid"
+if ("FID" %in% names(watersheds)) watersheds <- watersheds |> rename(FID_SRC = FID)
+if ("fid" %in% names(watersheds)) watersheds <- watersheds |> rename(fid_src = fid)
+try({
+  st_write(watersheds, watersheds_gpkg, layer = watersheds_gpkg_layer,
+           delete_dsn = TRUE, quiet = TRUE)
+}, silent = TRUE)
+extract_lu_pct <- function(lu_year, lu_path, watersheds_sf) {
+  r <- rast(lu_path)
+  watersheds_r <- st_transform(watersheds_sf, crs(r))
+  ws_v <- vect(watersheds_r)
+  ex <- terra::extract(r, ws_v)
+  ws_df <- st_drop_geometry(watersheds_r) |>
+    mutate(ID = row_number()) |>
+    dplyr::select(ID, PID, all_of(site_id))
+  ex <- left_join(ex, ws_df, by = "ID")
+  valcol <- names(r)[1]
+  out <- ex |>
+    filter(!is.na(.data[[valcol]])) |>
+    mutate(LU = .data[[valcol]]) |>
+    group_by(PID, .data[[site_id]], LU) |>
+    summarise(n = n(), .groups = "drop") |>
+    group_by(PID, .data[[site_id]]) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup() |>
+    mutate(lu_year = as.integer(lu_year))
+  out |>
+    mutate(LU_label = factor(LU, levels = 1:9, labels = LU_LEVELS)) |>
+    select(PID, all_of(site_id), lu_year, LU_label, pct) |>
+    pivot_wider(names_from = LU_label, values_from = pct, values_fill = 0)
+}
+cat("Extracting LU composition upstream...\n")
+lu_pct_all <- bind_rows(lapply(names(lu_files), function(y) {
+  extract_lu_pct(y, lu_files[[y]], watersheds)
+}))
+write.csv(lu_pct_all,
+          file.path(out_dir, "LU_upstream_pct_by_station_by_LUyear.csv"),
+          row.names = FALSE)
+wq_df <- wq_utm |> st_drop_geometry()
+wq_long <- wq_df |>
+  select(all_of(site_id),
+         starts_with("ammonia_"), starts_with("f_coli_"), starts_with("phospho_"),
+         starts_with("sulfate_"), starts_with("sus_sld_"), starts_with("TDS_"),
+         starts_with("TKN_"), starts_with("nitrate_"), starts_with("chlorid_"),
+         starts_with("chlophl_")) |>
+  pivot_longer(
+    cols = -all_of(site_id),
+    names_to = c("param", "yy"),
+    names_pattern = "^(.*)_([0-9]{2})$",
+    values_to = "value"
+  ) |>
+  mutate(year = 2000 + as.integer(yy)) |>
+  select(all_of(site_id), year, param, value) |>
+  pivot_wider(names_from = param, values_from = value)
+windows <- tibble(
+  lu_year = c(2001, 2005, 2010, 2015, 2020),
+  start   = c(2001, 2005, 2010, 2015, 2020),
+  end     = c(2005, 2010, 2015, 2020, 2025)
+)
+wq_years <- tibble(year = sort(unique(wq_long$year)))
+year_to_lu <- tidyr::crossing(wq_years, windows) |>
+  filter(year >= start & year <= end) |>
+  select(year, lu_year)
+wq_lu_multi <- wq_long |>
+  left_join(year_to_lu, by = "year") |>
+  left_join(lu_pct_all, by = c(site_id, "lu_year"))
+wq_lu_multi <- wq_lu_multi |>
+  group_by(.data[[site_id]], year) |>
+  mutate(
+    n_lu = n(),
+    is_current = lu_year == max(lu_year, na.rm = TRUE),
+    w_equal = 1 / n_lu,
+    w_boundary = ifelse(n_lu == 2 & is_current, 0.7,
+                        ifelse(n_lu == 2 & !is_current, 0.3, 1.0))
+  ) |>
+  ungroup()
+lu_cols <- LU_LEVELS
+legacy_equal <- wq_lu_multi |>
+  group_by(.data[[site_id]], year) |>
+  summarise(
+    across(all_of(lu_cols), ~ sum(.x * w_equal, na.rm = TRUE), .names = "LEGACYeq_{.col}"),
+    .groups = "drop"
+  )
+legacy_weighted <- wq_lu_multi |>
+  group_by(.data[[site_id]], year) |>
+  summarise(
+    across(all_of(lu_cols), ~ sum(.x * w_boundary, na.rm = TRUE), .names = "LEGACYw_{.col}"),
+    .groups = "drop"
+  )
+final_df <- wq_long |>
+  left_join(legacy_equal, by = c(site_id, "year")) |>
+  left_join(legacy_weighted, by = c(site_id, "year"))
+write.csv(final_df,
+          file.path(out_dir, "MODEL_TABLE_WQ_with_LEGACY_LU.csv"),
+          row.names = FALSE)
+cat("\nDONE.\nOutputs:\n",
+    "- ", watersheds_out_shp, "\n",
+    "- ", file.path(out_dir, "LU_upstream_pct_by_station_by_LUyear.csv"), "\n",
+    "- ", file.path(out_dir, "MODEL_TABLE_WQ_with_LEGACY_LU.csv"), "\n", sep = "")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(tidyr)
+  library(lme4)
+  library(broom.mixed)
+  library(performance)
+})
+model_csv <- "D:/.../MODEL_TABLE_WQ_with_LEGACY_LU.csv"
+out_dir <- "D:/.../REGRESSION_RESULTS"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+site_id <- "Name"
+wq_vars <- c("ammonia","f_coli","phospho","sulfate","sus_sld",
+             "TDS","TKN","nitrate","chlorid","chlophl")
+legacy_prefix <- "LEGACYw_"
+LU_LEVELS <- c("Residential","Commercial","Institutional","Industrial",
+               "TCU","Agricultural","OpenSpace","VacUC","WaterOther")
+ref_class <- "WaterOther"  # common choice (or "OpenSpace" etc.)
+df <- readr::read_csv(model_csv, show_col_types = FALSE)
+if (!(site_id %in% names(df))) stop("Missing site_id column: ", site_id)
+if (!("year" %in% names(df)))  stop("Missing 'year' column in model table.")
+name_map <- setNames(names(df), tolower(names(df)))
+missing_wq <- wq_vars[!(tolower(wq_vars) %in% names(name_map))]
+if (length(missing_wq) > 0) {
+  stop("These WQ variables were not found in the CSV (check spelling/case): ",
+       paste(missing_wq, collapse = ", "))
+}
+wq_cols <- unname(name_map[tolower(wq_vars)])
+lu_cols_all <- paste0(legacy_prefix, LU_LEVELS)
+missing_lu <- lu_cols_all[!(lu_cols_all %in% names(df))]
+if (length(missing_lu) > 0) {
+  stop("Missing LU predictor column(s):\n- ", paste(missing_lu, collapse = "\n- "))
+}
+lu_cols <- setdiff(lu_cols_all, paste0(legacy_prefix, ref_class))
+df <- df %>%
+  mutate(
+    year_c = year - mean(year, na.rm = TRUE),
+    station = as.factor(.data[[site_id]])
+  )
+fit_one_wq <- function(data, y_col, lu_cols, out_dir) {
+  dat <- data %>%
+    select(station, year, year_c, all_of(y_col), all_of(lu_cols)) %>%
+    filter(!is.na(.data[[y_col]])) %>%
+    drop_na(all_of(lu_cols))
+  y <- dat[[y_col]]
+  if (any(y < 0, na.rm = TRUE)) {
+    shift <- abs(min(y, na.rm = TRUE))
+    dat <- dat %>% mutate(y_use = log1p(.data[[y_col]] + shift))
+  } else {
+    dat <- dat %>% mutate(y_use = log1p(.data[[y_col]]))
+  }
+  fml <- as.formula(
+    paste("y_use ~", paste(c(lu_cols, "year_c"), collapse = " + "), "+ (1|station)")
+  )
+  mod <- lmer(fml, data = dat, REML = FALSE)
+  coefs <- broom.mixed::tidy(mod, effects = "fixed", conf.int = TRUE) %>%
+    mutate(
+      outcome = y_col,
+      n_obs = nrow(dat),
+      n_stations = n_distinct(dat$station)
+    )
+  diag <- tibble(
+    outcome = y_col,
+    n_obs = nrow(dat),
+    n_stations = n_distinct(dat$station),
+    AIC = AIC(mod),
+    BIC = BIC(mod),
+    R2_marginal = tryCatch(performance::r2(mod)$R2_marginal, error = function(e) NA_real_),
+    R2_conditional = tryCatch(performance::r2(mod)$R2_conditional, error = function(e) NA_real_),
+    singular = lme4::isSingular(mod, tol = 1e-4)
+  )
+  saveRDS(mod, file.path(out_dir, paste0("model_", y_col, ".rds")))
+  write_csv(coefs, file.path(out_dir, paste0("coef_", y_col, ".csv")))
+  write_csv(diag,  file.path(out_dir, paste0("diag_", y_col, ".csv")))
+ 
+  list(model = mod, coefs = coefs, diag = diag)
+}
+results <- vector("list", length(wq_cols))
+names(results) <- wq_cols
+for (j in seq_along(wq_cols)) {
+  y_col <- wq_cols[j]
+  cat("\nFitting:", y_col, "...\n")
+  results[[j]] <- fit_one_wq(df, y_col, lu_cols, out_dir)
+}
+coef_all <- bind_rows(lapply(results, `\[\[`, "coefs"))
+diag_all <- bind_rows(lapply(results, `\[\[`, "diag"))
+write_csv(coef_all, file.path(out_dir, "ALL_COEFFICIENTS.csv"))
+write_csv(diag_all, file.path(out_dir, "ALL_DIAGNOSTICS.csv"))
+cat("\nDONE.\nOutputs written to:\n", out_dir, "\n",
+    "- ALL_COEFFICIENTS.csv\n",
+    "- ALL_DIAGNOSTICS.csv\n",
+    "- model_<outcome>.rds (one per WQ variable)\n",
+    "- coef_<outcome>.csv  (one per WQ variable)\n",
+    "- diag_<outcome>.csv  (one per WQ variable)\n", sep = "")
+run_window_models <- function(data, y_col, lu_cols, out_dir) {
+  windows <- tibble::tibble(
+    lu_year = c(2001, 2005, 2010, 2015, 2020),
+    start   = c(2001, 2005, 2010, 2015, 2020),
+    end     = c(2005, 2010, 2015, 2020, 2025)
+  )
+  out <- list()
+  for (k in seq_len(nrow(windows))) {
+    w <- windows[k, ]
+    dat_w <- data %>%
+      filter(year >= w$start, year <= w$end) %>%
+      select(station, year, year_c, all_of(y_col), all_of(lu_cols)) %>%
+      filter(!is.na(.data[[y_col]])) %>%
+      drop_na(all_of(lu_cols))
+    if (nrow(dat_w) < 30) {
+      warning("Skipping window ", w$lu_year, " for ", y_col, " (too few rows).")
+      next
+    }
+    y <- dat_w[[y_col]]
+    if (any(y < 0, na.rm = TRUE)) {
+      shift <- abs(min(y, na.rm = TRUE))
+      dat_w <- dat_w %>% mutate(y_use = log1p(.data[[y_col]] + shift))
+    } else {
+      dat_w <- dat_w %>% mutate(y_use = log1p(.data[[y_col]]))
+    }
+    fml <- as.formula(
+      paste("y_use ~", paste(c(lu_cols, "year_c"), collapse = " + "), "+ (1|station)")
+    )
+    mod <- lmer(fml, data = dat_w, REML = FALSE)
+    coefs <- broom.mixed::tidy(mod, effects = "fixed", conf.int = TRUE) %>%
+      mutate(outcome = y_col, window_lu = w$lu_year, start = w$start, end = w$end,
+             n_obs = nrow(dat_w), n_stations = n_distinct(dat_w$station))
+    out[[as.character(w$lu_year)]] <- list(model = mod, coefs = coefs)
+  }
+  out
+}
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+  library(whitebox)
+})
+dem_path   <- "D:/.../DEM_mosaic.tif"
+wq_shp     <- "G:/.../WQ_FISH_DATA_COMBO.shp"
+site_id    <- "Name"
+target_crs <- "EPSG:32616"
+out_dir <- "D:/.../LEGACY_LU_WQ_STREAM"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+wbt_dir <- file.path(out_dir, "WBT_WORK")
+dir.create(wbt_dir, showWarnings = FALSE, recursive = TRUE)
+STREAM_BUFFER_M   <- 20000   
+BURN_DEPTH_M      <- 5
+POUR_SNAP_DIST_M  <- 300
+BREACH_DIST_M     <- 500
+STATION_SNAP_MAXM <- 10000
+wq <- st_read(wq_shp, quiet = TRUE)
+streams <- st_read(stream_shp, quiet = TRUE)
+if (!(site_id %in% names(wq))) stop("Missing site_id field: ", site_id)
+if (nrow(streams) == 0) stop("No stream features found.")
+wq_utm      <- st_transform(wq, target_crs) |> st_zm(drop = TRUE, what = "ZM")
+streams_utm <- st_transform(streams, target_crs) |> st_zm(drop = TRUE, what = "ZM")
+wq_utm      <- wq_utm[!st_is_empty(wq_utm), , drop = FALSE]
+streams_utm <- streams_utm[!st_is_empty(streams_utm), , drop = FALSE]
+gtype <- unique(as.character(st_geometry_type(streams_utm)))
+if (any(gtype %in% c("POLYGON", "MULTIPOLYGON"))) {
+  streams_utm <- st_boundary(streams_utm)
+}
+streams_ls <- st_cast(streams_utm, "LINESTRING", warn = FALSE)
+streams_ls <- streams_ls[!st_is_empty(streams_ls), , drop = FALSE]
+if (nrow(streams_ls) == 0) stop("No LINESTRING streams after casting.")
+stations <- wq_utm |>
+  dplyr::select(all_of(site_id)) |>
+  mutate(PID = row_number())
+nearest_point_on_line_robust <- function(points_sf, lines_sf) {
+  idx <- sf::st_nearest_feature(points_sf, lines_sf)
+  snapped_sfg <- vector("list", nrow(points_sf))
+  snap_dist_m <- numeric(nrow(points_sf))
+  for (i in seq_len(nrow(points_sf))) {
+    li  <- lines_sf[idx[i], ]
+    seg <- sf::st_nearest_points(points_sf[i, ], li)
+    pts <- sf::st_cast(seg, "POINT")
+    npts <- length(pts)
+    if (npts >= 2) {
+      p_on_line <- pts[[npts]]
+    } else if (npts == 1) {
+      p_on_line <- pts[[1]]
+    } else {
+      p_on_line <- sf::st_geometry(points_sf[i, ])[[1]]
+    }
+    snapped_sfg[[i]] <- p_on_line
+    p_sf <- sf::st_as_sf(sf::st_sfc(p_on_line, crs = sf::st_crs(points_sf)))
+    snap_dist_m[i] <- as.numeric(sf::st_distance(points_sf[i, ], p_sf, by_element = TRUE))
+  }
+  out <- points_sf
+  st_geometry(out) <- st_sfc(snapped_sfg, crs = st_crs(points_sf))
+  out$SNAP_DIST_M <- snap_dist_m
+  out
+}
+cat("Snapping stations to streams...\n")
+stations_stream <- nearest_point_on_line_robust(stations, streams_ls)
+print(summary(stations_stream$SNAP_DIST_M))
+stations_stream <- stations_stream |>
+  filter(SNAP_DIST_M <= STATION_SNAP_MAXM)
+if (nrow(stations_stream) == 0) {
+  stop("All stations were dropped by snap threshold.")
+}
+stations_gpkg <- file.path(out_dir, "stations_snapped_to_streams.gpkg")
+if (file.exists(stations_gpkg)) file.remove(stations_gpkg)
+st_write(stations_stream, stations_gpkg, layer = "stations_stream_snapped", quiet = TRUE)
+dem <- rast(dem_path)
+target_wkt <- st_crs(target_crs)$wkt
+if (!isTRUE(terra::crs(dem) == target_wkt)) {
+  cat("Projecting DEM to target CRS...\n")
+  dem <- terra::project(dem, target_wkt, method = "bilinear")
+}
+stream_buf <- st_buffer(streams_ls, STREAM_BUFFER_M) |> st_union()
+stream_buf_v <- vect(stream_buf)
+dem_clip <- dem |>
+  terra::crop(stream_buf_v) |>
+  terra::mask(stream_buf_v)
+dem_local <- file.path(wbt_dir, "dem_clipped.tif")
+writeRaster(dem_clip, dem_local, overwrite = TRUE)
+streams_local <- file.path(wbt_dir, "streams.shp")
+unlink(list.files(wbt_dir, pattern = "^streams\\.", full.names = TRUE))
+st_write(streams_ls, streams_local, quiet = TRUE)
+stations_pour <- stations_stream |>
+  dplyr::select(PID, all_of(site_id)) |>
+  st_zm(drop = TRUE, what = "ZM")
+pour_points_shp <- file.path(wbt_dir, "pour_points.shp")
+unlink(list.files(wbt_dir, pattern = "^pour_points\\.", full.names = TRUE))
+st_write(stations_pour, pour_points_shp, quiet = TRUE)
+dem_burn   <- file.path(wbt_dir, "dem_burned.tif")
+dem_breach <- file.path(wbt_dir, "dem_breached.tif")
+dem_fill   <- file.path(wbt_dir, "dem_filled.tif")
+d8_ptr     <- file.path(wbt_dir, "d8_pointer.tif")
+d8_acc     <- file.path(wbt_dir, "d8_accum.tif")
+pour_snapped <- file.path(wbt_dir, "pour_snapped.shp")
+wshed_ras    <- file.path(wbt_dir, "watersheds.tif")
+cat("Burning streams into DEM...\n")
+burn_ok <- FALSE
+try({
+  wbt_burn_streams_into_dem(
+    dem = dem_local,
+    streams = streams_local,
+    output = dem_burn,
+    burn_depth = BURN_DEPTH_M
+  )
+  burn_ok <- TRUE
+}, silent = TRUE)
+if (!burn_ok) {
+  warning("Stream burning failed; using unclipped DEM as-is.")
+  file.copy(dem_local, dem_burn, overwrite = TRUE)
+}
+cat("Breaching depressions...\n")
+breach_ok <- FALSE
+dem_for_fill <- dem_burn
+try({
+  wbt_breach_depressions_least_cost(
+    dem = dem_burn,
+    output = dem_breach,
+    dist = BREACH_DIST_M
+  )
+  breach_ok <- TRUE
+  dem_for_fill <- dem_breach
+}, silent = TRUE)
+if (!breach_ok) {
+  warning("Breach failed; proceeding with fill only.")
+  dem_for_fill <- dem_burn
+}
+cat("Filling depressions...\n")
+try({
+  wbt_fill_depressions_wang_and_liu(
+    dem = dem_for_fill,
+    output = dem_fill
+  )
+}, silent = TRUE)
+if (!file.exists(dem_fill)) {
+  wbt_fill_depressions(dem = dem_for_fill, output = dem_fill)
+}
+if (!file.exists(dem_fill)) stop("DEM conditioning failed.")
+cat("Creating D8 pointer...\n")
+wbt_d8_pointer(
+  dem = dem_fill,
+  output = d8_ptr
+)
+if (!file.exists(d8_ptr)) stop("D8 pointer raster not created.")
+cat("Creating D8 flow accumulation...\n")
+wbt_d8_flow_accumulation(
+  input = d8_ptr,
+  output = d8_acc,
+  out_type = "cells",
+  pntr = TRUE
+)
+if (!file.exists(d8_acc)) stop("D8 accumulation raster not created.")
+cat("Snapping pour points to high-accumulation cells...\n")
+wbt_snap_pour_points(
+  pour_pts   = pour_points_shp,
+  flow_accum = d8_acc,
+  output     = pour_snapped,
+  snap_dist  = POUR_SNAP_DIST_M
+)
+if (!file.exists(pour_snapped)) stop("Snapped pour points not created.")
+cat("Delineating watersheds...\n")
+wbt_watershed(
+  d8_pntr  = d8_ptr,
+  pour_pts = pour_snapped,
+  output   = wshed_ras
+)
+if (!file.exists(wshed_ras)) stop("Watershed raster not created.")
+cat("Converting watershed raster to polygons...\n")
+wr <- rast(wshed_ras)
+ws_poly <- as.polygons(wr, dissolve = TRUE, values = TRUE, na.rm = TRUE)
+watersheds_raw <- st_as_sf(ws_poly) |>
+  st_transform(target_crs) |>
+  st_make_valid()
+poly_idx <- st_geometry_type(watersheds_raw) %in% c("POLYGON", "MULTIPOLYGON")
+watersheds_raw <- watersheds_raw[poly_idx, , drop = FALSE]
+watersheds_raw <- watersheds_raw[!st_is_empty(watersheds_raw), , drop = FALSE]
+watersheds_raw <- st_cast(watersheds_raw, "MULTIPOLYGON", warn = FALSE)
+pour_pts_snapped <- st_read(pour_snapped, quiet = TRUE) |>
+  st_transform(target_crs) |>
+  st_make_valid()
+if (!("PID" %in% names(pour_pts_snapped))) {
+  df0 <- st_drop_geometry(pour_pts_snapped)
+  num_cols <- names(df0)[sapply(df0, function(x) is.numeric(x) || is.integer(x))]
+  if (length(num_cols) == 0) stop("Could not recover PID from snapped pour points.")
+  pour_pts_snapped <- pour_pts_snapped |>
+    mutate(PID = as.integer(.data[[num_cols[1]]]))
+}
+pour_small <- pour_pts_snapped |>
+  dplyr::select(any_of(c("PID", site_id)))
+watersheds <- st_join(watersheds_raw, pour_small, join = st_intersects, left = TRUE)
+miss <- which(is.na(watersheds$PID))
+if (length(miss) > 0) {
+  idx_near <- st_nearest_feature(watersheds[miss, ], pour_small)
+  watersheds$PID[miss] <- pour_small$PID[idx_near]
+  if (site_id %in% names(pour_small)) {
+    watersheds[[site_id]][miss] <- pour_small[[site_id]][idx_near]
+  }
+}
+watersheds <- watersheds |>
+  mutate(
+    area_m2  = as.numeric(st_area(geometry)),
+    area_km2 = area_m2 / 1e6
+  ) |>
+  arrange(PID)
+watersheds_shp  <- file.path(out_dir, "watersheds_with_pid.shp")
+watersheds_gpkg <- file.path(out_dir, "watersheds_with_pid.gpkg")
+unlink(list.files(out_dir, pattern = "^watersheds_with_pid\\.", full.names = TRUE))
+st_write(watersheds, watersheds_shp, quiet = TRUE)
+st_write(watersheds, watersheds_gpkg, layer = "watersheds_with_pid", delete_dsn = TRUE, quiet = TRUE)
+cat("\nDONE.\n")
+cat("Outputs:\n")
+cat("- ", watersheds_shp, "\n", sep = "")
+cat("- ", watersheds_gpkg, "\n", sep = "")
+cat("- ", pour_snapped, "\n", sep = "")
+cat("- ", wshed_ras, "\n", sep = "")
+cat("\nWatershed area summary (km²):\n")
+print(summary(watersheds$area_km2))
